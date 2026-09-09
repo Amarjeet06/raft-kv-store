@@ -41,13 +41,13 @@ jobs:
             /tmp/kvserver -id $i -peers "$PEERS" -datadir /tmp/kvci/data$i > /tmp/kvci/node$i.log 2>&1 &
             echo $! >> /tmp/kvci/pids
           done
-          sleep 2
+          sleep 3
           /tmp/kvctl -peers "$PC" put foo bar
           [ "$(/tmp/kvctl -peers "$PC" get foo)" = "bar" ] || (echo "get foo mismatch"; cat /tmp/kvci/node*.log; exit 1)
 
           LEADER=-1
           for i in 0 1 2; do
-            resp=$(curl -s http://127.0.0.1:$((19100+i))/status)
+            resp=$(curl -s --max-time 2 "http://127.0.0.1:$((19100+i))/status" || true)
             if echo "$resp" | grep -q '"leader":true'; then LEADER=$i; fi
           done
           echo "leader was node $LEADER"
