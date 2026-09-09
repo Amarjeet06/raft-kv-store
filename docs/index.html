@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raft-kv-store — live Raft demo</title>
+<style>
+  :root {
+    --bg: #0b0f17; --panel: #111827; --border: #232c3d; --text: #e5e9f2; --muted: #8b93a7;
+    --follower: #3b4252; --candidate: #d97706; --leader: #059669; --dead: #1f2430;
+    --accent: #60a5fa; --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 24px 20px 8px; max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  header p { color: var(--muted); font-size: 13.5px; line-height: 1.5; margin: 4px 0; }
+  header a { color: var(--accent); }
+  main { max-width: 980px; margin: 0 auto; padding: 8px 20px 40px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { background: #1c2536; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #26314a; }
+  input[type=text] { background: #0d1320; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+  #stage { position: relative; width: 100%; height: 300px; }
+  svg { width: 100%; height: 100%; }
+  .node-label { font-size: 12px; fill: var(--text); text-anchor: middle; font-weight: 600; }
+  .node-sub { font-size: 9.5px; fill: var(--muted); text-anchor: middle; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .log-entry { display: inline-block; min-width: 16px; height: 16px; border-radius: 3px; margin-right: 2px; background: #2b3648; font-size: 9px; line-height: 16px; text-align: center; color: #9aa5bb; padding: 0 2px; }
+  .log-entry.committed { background: var(--leader); color: #fff; }
+  #console { height: 150px; overflow-y: auto; background: #0a0e16; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: 11.5px/1.55 ui-monospace, "SF Mono", Menlo, monospace; color: #a9b4c8; }
+  #console div.ev-elect { color: #f59e0b; }
+  #console div.ev-leader { color: #34d399; }
+  #console div.ev-commit { color: #60a5fa; }
+  #console div.ev-crash { color: #f87171; }
+  .legend { display: flex; gap: 16px; font-size: 11.5px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<header>
+  <h1>raft-kv-store — live Raft consensus demo</h1>
+  <p>This runs a genuine reimplementation of the project's Raft algorithm — randomized-timeout leader election, AppendEntries log replication, and the &sect;5.4.2 "commit only from the leader's own term" safety rule — entirely in the JavaScript below, simulating real network latency, message loss, crashes, and partitions. It is the same algorithm as <a href="https://github.com/Amarjeet06/raft-kv-store/blob/main/raft/election.go">raft/election.go</a> and <a href="https://github.com/Amarjeet06/raft-kv-store/blob/main/raft/replication.go">raft/replication.go</a>, ported from Go, not a scripted animation. The production Go implementation — with its own from-scratch simulated-network test suite, a real HTTP transport, and a replicated KV store on top — lives in the <a href="https://github.com/Amarjeet06/raft-kv-store">GitHub repo</a>.</p>
+</header>
+<main>
+  <div class="panel">
+    <div class="controls">
+      <button id="btnWrite">Client Write</button>
+      <input type="text" id="writeVal" placeholder="value (optional)" style="width:110px">
+      <button id="btnKillLeader">Kill Leader</button>
+      <button id="btnKillRandom">Kill Random Node</button>
+      <button id="btnPartition">Partition Minority</button>
+      <button id="btnHeal">Heal / Restart Down Nodes</button>
+      <button id="btnReset">Reset Cluster</button>
+      <label style="margin-left:auto; font-size:12px; color:var(--muted)">
+        <input type="checkbox" id="chkSlow"> slow motion
+      </label>
+    </div>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--follower)"></span>Follower</span>
+      <span><span class="dot" style="background:var(--candidate)"></span>Candidate</span>
+      <span><span class="dot" style="background:var(--leader)"></span>Leader</span>
+      <span><span class="dot" style="background:var(--dead)"></span>Down / partitioned</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div id="stage"><svg id="svg" viewBox="0 0 700 260"></svg></div>
+  </div>
+
+  <div class="panel">
+    <table>
+      <thead><tr><th>Node</th><th>State</th><th>Term</th><th>Voted For</th><th>Commit Idx</th><th>Log (green = committed)</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <div style="font-size:12px; color:var(--muted); margin-bottom:6px;">Event log</div>
+    <div id="console"></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------
+// A from-scratch, browser-side reimplementation of this project's Raft
+// core (raft/raft.go, election.go, replication.go): randomized election
+// timeouts, RequestVote with the "up-to-date log" safety check,
+// AppendEntries with the PrevLogIndex/PrevLogTerm consistency check and
+// the fast conflict-backtrack optimization, and the section 5.4.2 rule
+// that a leader only commits entries replicated in its own current term.
+// Message delivery is simulated with random one-way latency and can drop
+// messages entirely (crash / partition) - the same role raft/network.go
+// plays for the real Go test suite, reimplemented here for the browser.
+// ---------------------------------------------------------------------
+
+const N = 5;
+const HEARTBEAT_MS = 250;
+const ELECTION_MIN = 700, ELECTION_MAX = 1300;
+const LATENCY_MIN = 20, LATENCY_MAX = 110;
+
+let SPEED = 1;
+let clock = 0;
+let timers = [];
+let nodes = [];
+let particles = [];
+let commandCounter = 0;
+
+function majority() { return Math.floor(N / 2) + 1; }
+
+function logEvent(cls, text) {
+  const el = document.getElementById("console");
+  const div = document.createElement("div");
+  div.className = cls;
+  div.textContent = "[t=" + (clock / 1000).toFixed(2) + "s] " + text;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  while (el.childNodes.length > 300) el.removeChild(el.firstChild);
+}
+
+function randRange(a, b) { return a + Math.random() * (b - a); }
+
+function makeNode(id) {
+  return {
+    id, alive: true, partitioned: false,
+    state: "follower", currentTerm: 0, votedFor: -1,
+    log: [{ term: 0, cmd: null }],
+    commitIndex: 0,
+    nextIndex: {}, matchIndex: {},
+    electionDeadline: 0, nextHeartbeatAt: 0, voteCount: 0,
+  };
+}
+
+function resetCluster() {
+  nodes = [];
+  for (let i = 0; i < N; i++) nodes.push(makeNode(i));
+  clock = 0;
+  timers = [];
+  particles = [];
+  commandCounter = 0;
+  document.getElementById("console").innerHTML = "";
+  for (const n of nodes) armElectionTimer(n);
+  logEvent("", "Cluster reset: " + N + " nodes, all followers, no leader yet.");
+}
+
+function armElectionTimer(n) {
+  n.electionDeadline = clock + randRange(ELECTION_MIN, ELECTION_MAX) * SPEED;
+}
+
+function lastLogIndex(n) { return n.log.length - 1; }
+function lastLogTerm(n) { return n.log[lastLogIndex(n)].term; }
+
+function becomeFollower(n, term) {
+  n.state = "follower";
+  n.currentTerm = term;
+  n.votedFor = -1;
+  armElectionTimer(n);
+}
+
+function nodePos(id) {
+  const cx = 350, cy = 128, r = 100;
+  const angle = -Math.PI / 2 + (2 * Math.PI * id) / N;
+  return { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+}
+
+function send(from, to, handler) {
+  if (!from.alive || !to.alive) return;
+  if (from.partitioned !== to.partitioned) return;
+  const latency = randRange(LATENCY_MIN, LATENCY_MAX) * SPEED;
+  const p1 = nodePos(from.id), p2 = nodePos(to.id);
+  particles.push({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, start: clock, end: clock + latency, color: "#60a5fa" });
+  timers.push({
+    at: clock + latency,
+    fn: function () {
+      if (!from.alive || !to.alive) return;
+      if (from.partitioned !== to.partitioned) return;
+      const reply = handler(to);
+      if (!reply) return;
+      const latency2 = randRange(LATENCY_MIN, LATENCY_MAX) * SPEED;
+      particles.push({ x1: p2.x, y1: p2.y, x2: p1.x, y2: p1.y, start: clock, end: clock + latency2, color: "#34d399" });
+      timers.push({ at: clock + latency2, fn: function () { if (from.alive && to.alive && from.partitioned === to.partitioned) reply(from); } });
+    },
+  });
+}
+
+function startElection(n) {
+  n.state = "candidate";
+  n.currentTerm += 1;
+  n.votedFor = n.id;
+  n.voteCount = 1;
+  armElectionTimer(n);
+  const term = n.currentTerm;
+  logEvent("ev-elect", "Node " + n.id + " times out waiting for a leader, starts election for term " + term);
+  for (const p of nodes) {
+    if (p.id === n.id) continue;
+    const args = { term, candidateId: n.id, lastLogIndex: lastLogIndex(n), lastLogTerm: lastLogTerm(n) };
+    send(n, p, function (to) {
+      let granted = false;
+      if (args.term > to.currentTerm) becomeFollower(to, args.term);
+      if (args.term === to.currentTerm) {
+        const upToDate = args.lastLogTerm > lastLogTerm(to) ||
+          (args.lastLogTerm === lastLogTerm(to) && args.lastLogIndex >= lastLogIndex(to));
+        if ((to.votedFor === -1 || to.votedFor === args.candidateId) && upToDate) {
+          to.votedFor = args.candidateId;
+          granted = true;
+          armElectionTimer(to);
+        }
+      }
+      const replyTerm = to.currentTerm;
+      const voterId = to.id;
+      return function (candidate) { onVoteReply(candidate, voterId, replyTerm, granted, term); };
+    });
+  }
+}
+
+function onVoteReply(candidate, voterId, term, granted, electionTerm) {
+  if (!candidate.alive) return;
+  if (term > candidate.currentTerm) { becomeFollower(candidate, term); return; }
+  if (candidate.state !== "candidate" || candidate.currentTerm !== electionTerm) return;
+  if (granted) {
+    candidate.voteCount++;
+    if (candidate.voteCount >= majority()) becomeLeader(candidate);
+  }
+}
+
+function becomeLeader(n) {
+  n.state = "leader";
+  logEvent("ev-leader", "Node " + n.id + " wins the election with " + n.voteCount + "/" + N + " votes -> LEADER for term " + n.currentTerm);
+  for (const p of nodes) {
+    if (p.id === n.id) continue;
+    n.nextIndex[p.id] = lastLogIndex(n) + 1;
+    n.matchIndex[p.id] = 0;
+  }
+  n.nextHeartbeatAt = clock;
+}
+
+function broadcastAppendEntries(n) {
+  for (const p of nodes) {
+    if (p.id === n.id) continue;
+    replicateTo(n, p);
+  }
+}
+
+function replicateTo(n, p) {
+  if (n.state !== "leader") return;
+  const next = n.nextIndex[p.id] || 1;
+  const prevLogIndex = next - 1;
+  const prevLogTerm = n.log[prevLogIndex] ? n.log[prevLogIndex].term : 0;
+  const entries = n.log.slice(next);
+  const term = n.currentTerm;
+  const leaderCommit = n.commitIndex;
+  const leaderId = n.id;
+  send(n, p, function (to) {
+    let success = false, conflictIndex = 0, conflictTerm = -1;
+    if (term < to.currentTerm) {
+      // stale leader, reject
+    } else {
+      if (term > to.currentTerm || to.state !== "follower") becomeFollower(to, term);
+      else armElectionTimer(to);
+      if (prevLogIndex > lastLogIndex(to)) {
+        conflictIndex = lastLogIndex(to) + 1;
+        conflictTerm = -1;
+      } else if (prevLogIndex >= 0 && to.log[prevLogIndex].term !== prevLogTerm) {
+        conflictTerm = to.log[prevLogIndex].term;
+        let idx = prevLogIndex;
+        while (idx > 0 && to.log[idx - 1].term === conflictTerm) idx--;
+        conflictIndex = idx;
+      } else {
+        let insertAt = prevLogIndex + 1;
+        for (let i = 0; i < entries.length; i++) {
+          const idx = insertAt + i;
+          if (idx <= lastLogIndex(to)) {
+            if (to.log[idx].term !== entries[i].term) {
+              to.log = to.log.slice(0, idx).concat(entries.slice(i));
+              break;
+            }
+            continue;
+          }
+          to.log = to.log.concat(entries.slice(i));
+          break;
+        }
+        if (leaderCommit > to.commitIndex) to.commitIndex = Math.min(leaderCommit, lastLogIndex(to));
+        success = true;
+      }
+    }
+    const replyTerm = to.currentTerm, peerId = to.id;
+    return function (leader) { onAppendReply(leader, peerId, replyTerm, success, conflictIndex, conflictTerm, prevLogIndex, entries.length, term); };
+  });
+}
+
+function onAppendReply(leader, peerId, term, success, conflictIndex, conflictTerm, prevLogIndex, entriesLen, sentTerm) {
+  if (!leader.alive) return;
+  if (term > leader.currentTerm) { becomeFollower(leader, term); return; }
+  if (leader.state !== "leader" || leader.currentTerm !== sentTerm) return;
+  if (success) {
+    const newMatch = prevLogIndex + entriesLen;
+    if (newMatch > (leader.matchIndex[peerId] || 0)) {
+      leader.matchIndex[peerId] = newMatch;
+      leader.nextIndex[peerId] = newMatch + 1;
+    }
+    tryAdvanceCommit(leader);
+  } else {
+    if (conflictTerm === -1) { leader.nextIndex[peerId] = conflictIndex; return; }
+    let lastIdx = -1;
+    for (let i = leader.log.length - 1; i > 0; i--) {
+      if (leader.log[i].term === conflictTerm) { lastIdx = i; break; }
+    }
+    leader.nextIndex[peerId] = lastIdx !== -1 ? lastIdx + 1 : conflictIndex;
+  }
+}
+
+function tryAdvanceCommit(n) {
+  const matches = [lastLogIndex(n)];
+  for (const p of nodes) if (p.id !== n.id) matches.push(n.matchIndex[p.id] || 0);
+  matches.sort(function (a, b) { return b - a; });
+  const majorityMatch = matches[Math.floor(N / 2)];
+  if (majorityMatch > n.commitIndex && n.log[majorityMatch] && n.log[majorityMatch].term === n.currentTerm) {
+    n.commitIndex = majorityMatch;
+    logEvent("ev-commit", "Leader " + n.id + " commits log index " + majorityMatch + ' ("' + n.log[majorityMatch].cmd + '") after a majority replicated it');
+  }
+}
+
+function clientWrite(value) {
+  const leader = nodes.find(function (n) { return n.state === "leader" && n.alive; });
+  if (!leader) { logEvent("ev-crash", "Client write rejected: no leader is currently elected"); return; }
+  commandCounter++;
+  const cmd = value || ("cmd" + commandCounter);
+  leader.log.push({ term: leader.currentTerm, cmd: cmd });
+  logEvent("", 'Client submits "' + cmd + '" to leader ' + leader.id + " as log index " + lastLogIndex(leader));
+  broadcastAppendEntries(leader);
+}
+
+function killLeader() {
+  const leader = nodes.find(function (n) { return n.state === "leader" && n.alive; });
+  if (!leader) { logEvent("ev-crash", "No leader to kill right now"); return; }
+  leader.alive = false;
+  logEvent("ev-crash", "Node " + leader.id + " (leader, term " + leader.currentTerm + ") crashed");
+}
+
+function killRandom() {
+  const candidates = nodes.filter(function (n) { return n.alive; });
+  if (candidates.length === 0) return;
+  const n = candidates[Math.floor(Math.random() * candidates.length)];
+  n.alive = false;
+  logEvent("ev-crash", "Node " + n.id + " (" + n.state + ") crashed");
+}
+
+function partitionMinority() {
+  const minoritySize = Math.floor(N / 2);
+  const ids = nodes.map(function (n) { return n.id; });
+  const minority = ids.slice(0, minoritySize);
+  for (const n of nodes) n.partitioned = minority.indexOf(n.id) !== -1;
+  logEvent("ev-crash", "Network partitioned: {" + minority.join(",") + "} isolated from {" + ids.slice(minoritySize).join(",") + "} (minority side can never commit)");
+}
+
+function healNetwork() {
+  let revived = [];
+  for (const n of nodes) {
+    n.partitioned = false;
+    if (!n.alive) {
+      n.alive = true;
+      n.state = "follower";
+      n.commitIndex = 0; // volatile state, not persisted - rebuilt from the leader's heartbeats after restart, exactly like raft.Make() loading only currentTerm/votedFor/log
+      n.nextIndex = {};
+      n.matchIndex = {};
+      armElectionTimer(n);
+      revived.push(n.id);
+    }
+  }
+  if (revived.length) logEvent("", "Network healed; node(s) " + revived.join(",") + " restart as followers (currentTerm/votedFor/log survive, exactly as FilePersister persists them on disk)");
+  else logEvent("", "Network healed; all partitions cleared");
+}
+
+// ---- render ----
+const svgNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs) {
+  const e = document.createElementNS(svgNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+function stateColor(n) {
+  if (!n.alive) return "var(--dead)";
+  if (n.partitioned) return "var(--dead)";
+  if (n.state === "leader") return "var(--leader)";
+  if (n.state === "candidate") return "var(--candidate)";
+  return "var(--follower)";
+}
+
+function render() {
+  const svg = document.getElementById("svg");
+  svg.innerHTML = "";
+  // faint connecting lines
+  for (let i = 0; i < N; i++) {
+    for (let j = i + 1; j < N; j++) {
+      const a = nodePos(i), b = nodePos(j);
+      svg.appendChild(el("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: "#1c2536", "stroke-width": 1 }));
+    }
+  }
+  // in-flight particles
+  const now = clock;
+  particles = particles.filter(function (p) { return p.end >= now - 50; });
+  for (const p of particles) {
+    if (now < p.start || now > p.end) continue;
+    const t = (now - p.start) / Math.max(1, p.end - p.start);
+    const x = p.x1 + (p.x2 - p.x1) * t, y = p.y1 + (p.y2 - p.y1) * t;
+    svg.appendChild(el("circle", { cx: x, cy: y, r: 3.5, fill: p.color }));
+  }
+  // nodes
+  for (const n of nodes) {
+    const pos = nodePos(n.id);
+    const g = el("g", {});
+    g.appendChild(el("circle", { cx: pos.x, cy: pos.y, r: 26, fill: stateColor(n), stroke: n.state === "leader" ? "#34d399" : "#00000000", "stroke-width": 2, opacity: n.alive ? 1 : 0.45 }));
+    const label = el("text", { class: "node-label", x: pos.x, y: pos.y - 1 });
+    label.textContent = "N" + n.id;
+    g.appendChild(label);
+    const sub = el("text", { class: "node-sub", x: pos.x, y: pos.y + 12 });
+    sub.textContent = n.alive ? ("T" + n.currentTerm) : "down";
+    g.appendChild(sub);
+    svg.appendChild(g);
+  }
+
+  // table
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = "";
+  for (const n of nodes) {
+    const tr = document.createElement("tr");
+    const stateText = !n.alive ? "DOWN" : (n.partitioned ? n.state + " (partitioned)" : n.state);
+    let logHtml = "";
+    for (let i = 1; i < n.log.length; i++) {
+      const committed = i <= n.commitIndex ? " committed" : "";
+      logHtml += '<span class="log-entry' + committed + '" title="term ' + n.log[i].term + ': ' + n.log[i].cmd + '">' + n.log[i].term + "</span>";
+    }
+    tr.innerHTML = "<td>Node " + n.id + "</td><td>" + stateText + "</td><td>" + n.currentTerm + "</td><td>" +
+      (n.votedFor === -1 ? "-" : n.votedFor) + "</td><td>" + n.commitIndex + "</td><td>" + (logHtml || "<span style=\"color:var(--muted)\">(empty)</span>") + "</td>";
+    tbody.appendChild(tr);
+  }
+}
+
+// ---- main loop ----
+let lastTs = null;
+function frame(ts) {
+  if (lastTs === null) lastTs = ts;
+  let dt = ts - lastTs;
+  lastTs = ts;
+  dt = Math.min(dt, 100);
+  clock += dt;
+
+  const due = [];
+  const pending = [];
+  for (const t of timers) { if (t.at <= clock) due.push(t); else pending.push(t); }
+  timers = pending;
+  due.sort(function (a, b) { return a.at - b.at; });
+  for (const t of due) t.fn();
+
+  for (const n of nodes) {
+    if (!n.alive) continue;
+    if (n.state !== "leader" && clock >= n.electionDeadline) startElection(n);
+    if (n.state === "leader" && clock >= n.nextHeartbeatAt) {
+      broadcastAppendEntries(n);
+      n.nextHeartbeatAt = clock + HEARTBEAT_MS * SPEED;
+    }
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+document.getElementById("btnWrite").addEventListener("click", function () {
+  const v = document.getElementById("writeVal").value.trim();
+  clientWrite(v);
+  document.getElementById("writeVal").value = "";
+});
+document.getElementById("btnKillLeader").addEventListener("click", killLeader);
+document.getElementById("btnKillRandom").addEventListener("click", killRandom);
+document.getElementById("btnPartition").addEventListener("click", partitionMinority);
+document.getElementById("btnHeal").addEventListener("click", healNetwork);
+document.getElementById("btnReset").addEventListener("click", resetCluster);
+document.getElementById("chkSlow").addEventListener("change", function (e) { SPEED = e.target.checked ? 3 : 1; });
+
+resetCluster();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

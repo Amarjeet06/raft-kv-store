@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit + integration test suite (election, replication, partition tolerance, crash/restart, KV layer)
+        run: go test ./... -timeout 120s -v
+
+      - name: Same suite under the race detector, repeated to shake out timing-dependent bugs
+        run: go test ./... -race -count=5 -timeout 300s
+
+      - name: Build the real deployment binaries (kvserver, kvctl)
+        run: |
+          go build -o /tmp/kvserver ./cmd/kvserver
+          go build -o /tmp/kvctl ./cmd/kvctl
+
+      - name: Live 3-process cluster smoke test over real HTTP (leader election, writes, crash + failover)
+        run: |
+          set -e
+          PEERS="0=127.0.0.1:19100,1=127.0.0.1:19101,2=127.0.0.1:19102"
+          PC="127.0.0.1:19100,127.0.0.1:19101,127.0.0.1:19102"
+          for i in 0 1 2; do
+            mkdir -p /tmp/kvci/data$i
+            /tmp/kvserver -id $i -peers "$PEERS" -datadir /tmp/kvci/data$i > /tmp/kvci/node$i.log 2>&1 &
+            echo $! >> /tmp/kvci/pids
+          done
+          sleep 2
+          /tmp/kvctl -peers "$PC" put foo bar
+          [ "$(/tmp/kvctl -peers "$PC" get foo)" = "bar" ] || (echo "get foo mismatch"; cat /tmp/kvci/node*.log; exit 1)
+
+          LEADER=-1
+          for i in 0 1 2; do
+            resp=$(curl -s http://127.0.0.1:$((19100+i))/status)
+            echo "$resp" | grep -q '"leader":true' && LEADER=$i
+          done
+          echo "leader was node $LEADER"
+          LPID=$(sed -n "$((LEADER+1))p" /tmp/kvci/pids)
+          kill -9 "$LPID"
+          sleep 2
+
+          /tmp/kvctl -peers "$PC" put after_crash still_works
+          [ "$(/tmp/kvctl -peers "$PC" get after_crash)" = "still_works" ] || (echo "post-crash write/read failed"; cat /tmp/kvci/node*.log; exit 1)
+          [ "$(/tmp/kvctl -peers "$PC" get foo)" = "bar" ] || (echo "pre-crash data lost"; cat /tmp/kvci/node*.log; exit 1)
+          echo "cluster survived a real leader crash and kept serving writes"
+          pkill -9 -f /tmp/kvserver || true
