@@ -6,6 +6,7 @@
 package kvstore
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -72,7 +73,26 @@ func (kv *KVStore) applyLoop(applyCh chan raft.ApplyMsg) {
 		if !msg.CommandValid {
 			continue
 		}
-		op := msg.Command.(Op)
+		// The Raft layer treats Command as an opaque interface{} and, over
+		// the real HTTPTransport, round-trips every log entry through
+		// JSON to cross the wire between processes - which decodes any
+		// interface{} holding a struct back as a plain map[string]any,
+		// not the original Op (Go's encoding/json has no way to recover a
+		// concrete type from an interface{} target). Encoding Op as a
+		// JSON string before it ever reaches Start() sidesteps that: a
+		// JSON string decodes back into a Go string in both the
+		// in-process simulated Network (never serialized at all) and the
+		// real HTTP path (actually serialized), so this same decode step
+		// is correct either way instead of needing a transport-specific
+		// special case.
+		raw, ok := msg.Command.(string)
+		if !ok {
+			continue
+		}
+		var op Op
+		if err := json.Unmarshal([]byte(raw), &op); err != nil {
+			continue
+		}
 
 		kv.mu.Lock()
 		if kv.lastSeq[op.ClientID] < op.ClientSeq {
@@ -100,7 +120,11 @@ func (kv *KVStore) applyLoop(applyCh chan raft.ApplyMsg) {
 // entry - the classic case Start()'s returned index alone doesn't protect
 // against).
 func (kv *KVStore) propose(op Op) error {
-	index, term, isLeader := kv.rf.Start(op)
+	payload, err := json.Marshal(op)
+	if err != nil {
+		return err
+	}
+	index, term, isLeader := kv.rf.Start(string(payload))
 	if !isLeader {
 		return ErrNotLeader
 	}
