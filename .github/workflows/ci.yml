@@ -48,7 +48,7 @@ jobs:
           LEADER=-1
           for i in 0 1 2; do
             resp=$(curl -s http://127.0.0.1:$((19100+i))/status)
-            echo "$resp" | grep -q '"leader":true' && LEADER=$i
+            if echo "$resp" | grep -q '"leader":true'; then LEADER=$i; fi
           done
           echo "leader was node $LEADER"
           LPID=$(sed -n "$((LEADER+1))p" /tmp/kvci/pids)
